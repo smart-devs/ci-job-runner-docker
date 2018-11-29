@@ -1,0 +1,67 @@
+# container structure test configuration
+
+schemaVersion: '2.0.0'
+
+metadataTest:
+  env:
+    - key: PATH
+      value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    - key: DOCKER_HOST
+      value: tcp://localhost:2375
+  entrypoint: []
+  cmd: ["bash"]
+  exposedPorts: []
+  volumes: []
+
+commandTests:
+  - name: "check docker is found in $PATH"
+    command: "which"
+    args: ["docker"]
+    expectedOutput: ['/usr/bin/docker']
+  - name: "check docker is executable"
+    command: "docker"
+    args: ["version"]
+    expectedOutput:
+      - '.*Version:.*18.06.1-ce.*'
+    exitCode: 1 # docker daemon is not running so we expect an error but validate the output
+
+fileExistenceTests:
+  - name: 'FILE check docker-disable-recommends exists'
+    path: '/etc/apt/apt.conf.d/docker-disable-recommends'
+    shouldExist: true
+    permissions: '-rw-r--r--'
+    uid: 0
+    gid: 0
+  - name: 'check /usr/share/man/man1 exists'
+    path: '/usr/share/man/man1'
+    shouldExist: true
+    permissions: 'drwxr-xr-x'
+    uid: 0
+    gid: 0
+  - name: 'check /usr/share/man/man7 exists'
+    path: '/usr/share/man/man1'
+    shouldExist: true
+    permissions: 'drwxr-xr-x'
+    uid: 0
+    gid: 0
+  - name: 'check /usr/bin/docker exists and executable'
+    path: '/usr/bin/docker'
+    shouldExist: true
+    permissions: '-rwxr-xr-x'
+    uid: 0
+    gid: 0
+    isExecutableBy: 'any'
+  - name: 'check /root/.docker/config.json exists and is readable'
+    path: '/root/.docker/config.json'
+    shouldExist: true
+    permissions: '-rw-r--r--'
+    uid: 0
+    gid: 0
+
+fileContentTests:
+  - name: 'APT disable install recommends'
+    expectedContents: ['APT::Install-Recommends "false";']
+    path: '/etc/apt/apt.conf.d/docker-disable-recommends'
+  - name: 'check docker config has content'
+    expectedContents: ['.*"credHelpers".*', '.*"auths".*']
+    path: '/root/.docker/config.json'

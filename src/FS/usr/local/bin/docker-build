@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+
+set -o errexit  # Exit script when a command exits with non-zero status
+set -o errtrace # Exit on error inside any functions or sub-shells
+set -o nounset  # Exit script on use of an undefined variable
+set -o pipefail # Return exit status of the last command in the pipe that failed
+
+readonly EX_OK=0                # Successful termination
+readonly EX_UNKNOWN=1           # Unknown error occured
+readonly EX_DOCKER_BUILD=3      # Docker build failed
+readonly EX_DOCKER=4            # Docker not found or running
+
+# Global variables
+declare DOCKER_CACHE=false
+declare DOCKER_SQUASH=false
+declare DOCKER_BUILD_TAG=""
+declare DOCKER_BUILD_FILE=""
+declare DOCKER_BUILD_QUIET=false
+declare -a BUILD_CACHE_IMAGES=()
+
+# ------------------------------------------------------------------------------
+# Displays a error message and is able to terminate te script execution
+#
+# Arguments:
+#   $1 Error message
+#   $2 Exit code, script will continue execution when omitted
+# Returns:
+#   None
+# ------------------------------------------------------------------------------
+display_error_message() {
+  local status=${1}
+  local exitcode=${2:-0}
+
+  echo >&2
+  echo " !     ERROR: ${status}"
+  echo >&2
+
+  if [[ ${exitcode} -ne 0 ]]; then
+    exit "${exitcode}"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Displays a notice
+#
+# Arguments:
+#   $* Notice message to display
+# Returns:
+#   Exit code
+# ------------------------------------------------------------------------------
+display_notice_message() {
+  local status=$*
+
+  echo
+  echo "NOTICE: ${status}"
+  echo
+}
+
+# ------------------------------------------------------------------------------
+# Displays a status message
+#
+# Arguments:
+#   $* Status message to display
+# Returns:
+#   Exit code
+# ------------------------------------------------------------------------------
+display_status_message() {
+  local status=$*
+
+  echo "-----> ${status}"
+}
+
+# ------------------------------------------------------------------------------
+# Check to see if the Docker daemon is actually running
+#
+# Arguments:
+#   None
+# Returns:
+#   Exit code
+# ------------------------------------------------------------------------------
+require_docker_running() {
+    display_status_message 'Ensuring Docker daemon is running'
+    if ! docker info > /dev/null 2>&1; then
+        display_error_message \
+            'Cannot connect to the Docker daemon. Is it running?' \
+            "${EX_DOCKER}"
+    fi
+
+    return "${EX_OK}"
+}
+
+# ------------------------------------------------------------------------------
+# Check to see if the Docker daemon is supporting squash
+#
+# Arguments:
+#   None
+# Returns:
+#   Exit code
+# ------------------------------------------------------------------------------
+require_docker_squash() {
+    if [[ "${DOCKER_SQUASH}" = true ]]; then
+        if [[ $(docker version -f '{{.Server.Experimental}}') = true ]]; then
+            display_status_message 'Ensuring Docker daemon is supporting squashing'
+            if ! docker build --help | grep "\-\-squash" > /dev/null 2>&1; then
+                display_notice_message 'Docker Daemon is not supporting squash.'
+                DOCKER_SQUASH=false
+            fi
+        else
+            display_notice_message 'Docker Daemon should be running in experimental mode for supporting squash.'
+            DOCKER_SQUASH=false
+        fi
+    fi
+    return "${EX_OK}"
+}
+
+
+
+# ------------------------------------------------------------------------------
+# Try to pull latest version of the current images to use them as build cache
+#
+# Arguments:
+#   None
+# Returns:
+#   Exit code
+# ------------------------------------------------------------------------------
+docker_warm_up_cache() {
+    if [[ "${DOCKER_CACHE}" = true ]]; then
+        display_status_message 'Warming up build cache'
+        for WARM_UP_IMAGE in $(echo "${CI_REGISTRY_IMAGE:-} ${ECR_REPOSITORY_URL:-} ${DOCKERHUB_REPOSITORY_URL:-} ${CUSTOM_REPOSITORY_URL:-}" | sed 's/[ \t]{2,}$/ /'); do
+            if grep -o -P '^(?:(?=[^:\/]{4,253})(?!-)[a-zA-Z0-9-]{1,63}(?<!-)(?:\.(?!-)[a-zA-Z0-9-]{1,63}(?<!-))*(?::[0-9]{1,5})?\/)?(?:(?![._-])(?:[a-z0-9._-]*)(?<![._-])(?:\/(?![._-])[a-z0-9._-]*(?<![._-]))*)(?::(?![.-])[a-zA-Z0-9_.-]{1,128})?$' <<< "${WARM_UP_IMAGE}"; then
+                if docker pull "${WARM_UP_IMAGE%:*}:latest" > /dev/null 2>&1; then
+                    BUILD_CACHE_IMAGES+=("${WARM_UP_IMAGE%:*}:latest")
+                    display_notice_message "Build cache warm up from ${WARM_UP_IMAGE%:*}:latest succeed."
+            fi
+        fi
+        done
+        if [[ ${#BUILD_CACHE_IMAGES[@]} -eq 0 ]]; then
+            display_notice_message "Cache warm up failed, continuing without it"
+            DOCKER_CACHE=false
+        else
+            display_notice_message "Cache warm up completed."
+        fi
+    fi
+    return "${EX_OK}"
+}
+
+# ------------------------------------------------------------------------------
+# Docker build the image
+#
+# Arguments:
+#   None
+# Returns:
+#   Exit code
+# ------------------------------------------------------------------------------
+docker_build() {
+    local -a build_args
+    display_status_message "Running Docker build for \"${DOCKER_BUILD_TAG}\""
+
+    build_args+=(--pull)
+    build_args+=(--compress)
+    if [[ "${DOCKER_SQUASH}" = true ]]; then
+        build_args+=(--squash)
+    fi
+    for env_var in $(env); do
+        if [[  "${env_var}" =~ DOCKER_BUILD_ARG_([a-zA-Z_\-]+)=(.*)$ ]]; then
+            build_args+=(--build-arg "${BASH_REMATCH[1]}=${BASH_REMATCH[2]}")
+        fi
+    done
+    if [[ "${DOCKER_CACHE}" = true && ${#BUILD_CACHE_IMAGES[@]} -gt 0 ]]; then
+        for BUILD_CACHE_IMAGE in "${BUILD_CACHE_IMAGES[@]}"; do
+            build_args+=(--cache-from "${BUILD_CACHE_IMAGE}")
+        done
+    else
+        build_args+=(--no-cache)
+    fi
+
+    if [[ "${DOCKER_BUILD_QUIET}" = true ]]; then
+        build_args+=(--quiet)
+    fi
+
+    build_args+=(--tag "${DOCKER_BUILD_TAG}")
+    build_args+=(--file "${DOCKER_BUILD_FILE}")
+
+    case ${DOCKER_BUILD_FILE} in
+        /*) DOCKER_BUILD_PATH="${DOCKER_BUILD_FILE}";;
+        *) DOCKER_BUILD_PATH="${PWD}/${DOCKER_BUILD_FILE}";;
+    esac
+    if [[ ${CI_DEBUG_TRACE:-} == true || ${CI_DEBUG_TRACE:-} == "true" ]]; then
+        echo "${build_args[*]}"
+    fi
+    docker build "${build_args[@]}" "${DOCKER_BUILD_PATH%/*}" || display_error_message 'Docker build failed' "${EX_DOCKER_BUILD}"
+    display_status_message 'Docker build finished'
+
+    return "${EX_OK}"
+}
+
+display_help () {
+    local exit_code=${1:-${EX_OK}}
+    local status=${2:-}
+
+    [[ ! -z "${status}" ]] && display_error_message "${status}"
+
+    cat << EOF
+Usage: /usr/local/bin/docker-build [options]
+Options:
+    -h, Display this help and exit.
+    -s, Squash newly built layers into a single new layer.
+    -c, Enable build from cache.
+    -q, Suppress the docker build output
+    -t, Tag for the output image (Required) <name:tag>
+    -f, Dockerfile to use (Required)
+EOF
+
+    exit "${exit_code}"
+}
+parse_cli_arguments() {
+    local OPTIND o
+    while getopts ":hscqt:f:" o; do
+        case "${o}" in
+            t)
+                DOCKER_BUILD_TAG=${OPTARG}
+                ;;
+            f)
+                DOCKER_BUILD_FILE=${OPTARG}
+                ;;
+            s)
+                DOCKER_SQUASH=true
+                ;;
+            c)
+                DOCKER_CACHE=true
+                ;;
+            q)
+                DOCKER_BUILD_QUIET=true
+                ;;
+            h)
+                display_help "${EX_OK}"
+                ;;
+            :)
+                display_help "${EX_UNKNOWN}" "Option -${OPTARG} requires an argument";
+            ;;
+            \?)
+                display_help "${EX_UNKNOWN}" "Invalid option: -${OPTARG}";
+            ;;
+            *)
+                display_help "${EX_UNKNOWN}" "Missing required arguments.";
+                ;;
+        esac
+    done
+    shift $((OPTIND-1))
+    if [[ -z "${DOCKER_BUILD_TAG// }" ]]; then
+        display_help "${EX_UNKNOWN}" "Option -t is required";
+    fi
+
+    if ! grep -q -o -P '^(?:(?=[^:\/]{4,253})(?!-)[a-zA-Z0-9-]{1,63}(?<!-)(?:\.(?!-)[a-zA-Z0-9-]{1,63}(?<!-))*(?::[0-9]{1,5})?\/)?(?:(?![._-])(?:[a-z0-9._-]*)(?<![._-])(?:\/(?![._-])[a-z0-9._-]*(?<![._-]))*)(?::(?![.-])[a-zA-Z0-9_.-]{1,128})$' <<< "${DOCKER_BUILD_TAG}"; then
+        display_help "${EX_UNKNOWN}" "Option -t is not an valid image:tag";
+    fi
+
+    if [[ -z "${DOCKER_BUILD_FILE// }" ]]; then
+        display_help "${EX_UNKNOWN}" "Option -f is required";
+    fi
+}
+
+# ==============================================================================
+# RUN LOGIC
+# ------------------------------------------------------------------------------
+main() {
+    # Parse input
+    parse_cli_arguments "$@"
+    # Check requirements
+    require_docker_running
+    require_docker_squash
+    # warm up build cache
+    docker_warm_up_cache
+    # build image
+    docker_build
+
+    exit "${EX_OK}"
+}
+
+# Bootstrap
+if [[ "${BASH_SOURCE[0]}" = "${0}" ]]; then
+    # Direct call to file
+    main "$@"
+fi  # Else file is included from another script
